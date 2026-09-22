@@ -563,6 +563,27 @@ def save_storage_state(cookie_dir: str, nid: str, storage_state):
         json.dump(storage_state, f, ensure_ascii=False, indent=2)
 
 
+def persist_runtime_storage(session_db, cookie_dir: str, user_id: str, storage_state, emit: Optional[Callable[[str], None]] = None):
+    """Persist runtime browser cookies only when the authenticated session survived.
+
+    Reward redirects can occasionally clear NID_AUT/NID_SES. Saving that
+    incomplete browser state would destroy the last usable login state and
+    make the account look like it has no cookies on the next run.
+    """
+    storage_state, normalized_names = normalize_persistent_login_cookies(storage_state)
+    ok, message = check_storage_data_status(storage_state)
+    if not ok:
+        if emit:
+            emit(f"{user_id}: runtime cookie save skipped ({message})")
+        return False, message
+
+    if normalized_names and emit:
+        emit(f"{user_id}: normalized runtime cookies for persistence: {', '.join(normalized_names)}")
+    session_db.merge(User(user_id=user_id, storage_state=json.dumps(storage_state), updated_at=datetime.now()))
+    save_storage_state(cookie_dir, user_id, storage_state)
+    return True, message
+
+
 def storage_cookie_values(storage_state):
     values = {}
     try:
@@ -2327,9 +2348,7 @@ async def process_account(
             else:
                 result.estimated_points = 0
             new_storage = await context.storage_state()
-            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(new_storage, f, ensure_ascii=False, indent=2)
+            persist_runtime_storage(session_db, cookie_dir, account.user_id, new_storage, emit)
         else:
             result.details.append(DetailResult(user_id=account.user_id, status="login_error", message=login_message))
         await context.close()
@@ -2404,9 +2423,7 @@ async def process_account_manual_link(
             else:
                 result.estimated_points = 0
             new_storage = await context.storage_state()
-            session_db.merge(User(user_id=account.user_id, storage_state=json.dumps(new_storage), updated_at=datetime.now()))
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(new_storage, f, ensure_ascii=False, indent=2)
+            persist_runtime_storage(session_db, cookie_dir, account.user_id, new_storage, emit)
         else:
             result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message=login_message))
         await context.close()
