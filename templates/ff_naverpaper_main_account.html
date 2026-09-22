@@ -119,6 +119,49 @@
   font-weight: 700;
 }
 
+.np-visit-manager {
+  width: 100%;
+}
+
+.np-visit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.np-visit-summary {
+  color: #555;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.np-visit-progress-wrap {
+  margin-top: 8px;
+}
+
+.np-visit-progress-wrap .progress {
+  height: 18px;
+  margin-bottom: 5px;
+}
+
+.np-visit-progress-text {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.np-visit-output {
+  margin: 6px 0 0;
+  padding: 7px 9px;
+  max-height: 135px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #f7f7f7;
+  border: 1px solid #e3e3e3;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
 .np-preview-panel {
   min-height: 520px;
 }
@@ -268,6 +311,25 @@
             <label>쿠키 상태</label>
             <div id="profile_cookie_status_{{ loop.index0 }}" class="np-cookie-status"></div>
           </div>
+
+          <div class="np-field np-status-row">
+            <label>방문기록 관리</label>
+            <div class="np-visit-manager" data-profile-index="{{ loop.index0 }}">
+              <div class="np-visit-actions">
+                <button type="button" class="btn btn-sm btn-outline-warning np-visit-recovery-btn">오류 방문기록 복구</button>
+                <button type="button" class="btn btn-sm btn-outline-danger np-visit-all-btn">방문기록 전체 초기화</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary np-visit-refresh-btn">현황 새로고침</button>
+              </div>
+              <div id="profile_visit_summary_{{ loop.index0 }}" class="np-visit-summary">방문기록 현황을 확인하는 중입니다.</div>
+              <div id="profile_visit_progress_wrap_{{ loop.index0 }}" class="np-visit-progress-wrap" style="display:none;">
+                <div class="progress">
+                  <div id="profile_visit_progress_{{ loop.index0 }}" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%;">0%</div>
+                </div>
+                <div id="profile_visit_progress_text_{{ loop.index0 }}" class="np-visit-progress-text"></div>
+                <pre id="profile_visit_output_{{ loop.index0 }}" class="np-visit-output"></pre>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="np-preview-panel">
@@ -333,6 +395,25 @@
           <label>쿠키 상태</label>
           <div id="profile_cookie_status_{{ idx }}" class="np-cookie-status"></div>
         </div>
+
+        <div class="np-field np-status-row">
+          <label>방문기록 관리</label>
+          <div class="np-visit-manager" data-profile-index="{{ idx }}">
+            <div class="np-visit-actions">
+              <button type="button" class="btn btn-sm btn-outline-warning np-visit-recovery-btn">오류 방문기록 복구</button>
+              <button type="button" class="btn btn-sm btn-outline-danger np-visit-all-btn">방문기록 전체 초기화</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary np-visit-refresh-btn">현황 새로고침</button>
+            </div>
+            <div id="profile_visit_summary_{{ idx }}" class="np-visit-summary">계정을 저장한 후 방문기록을 확인할 수 있습니다.</div>
+            <div id="profile_visit_progress_wrap_{{ idx }}" class="np-visit-progress-wrap" style="display:none;">
+              <div class="progress">
+                <div id="profile_visit_progress_{{ idx }}" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%;">0%</div>
+              </div>
+              <div id="profile_visit_progress_text_{{ idx }}" class="np-visit-progress-text"></div>
+              <pre id="profile_visit_output_{{ idx }}" class="np-visit-output"></pre>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="np-preview-panel">
@@ -360,6 +441,8 @@ var nextProfileOrder = {{ initial_profiles|length + 1 }};
 var npImageZoom = 2;
 var isCollectionRunning = {{ 'true' if arg.get('is_running') else 'false' }};
 var collectionLoginBlockMessage = '현재 수집중입니다. 수집이 완료되면 로그인 해 주세요';
+var visitJobPollTimer = null;
+var visitJobFinalNotified = {};
 
 function readProfile(index) {
   return {
@@ -490,6 +573,205 @@ function setCookieStatusField(id, result) {
     .removeClass('ok warn')
     .addClass(result.className || '')
     .text(result.text || '');
+}
+
+function findProfileIndexByUserId(userId) {
+  var found = null;
+  $('#profile_blocks .profile-block').each(function() {
+    var index = $(this).attr('data-profile-index');
+    if (readProfile(index).user_id === userId) {
+      found = index;
+      return false;
+    }
+  });
+  return found;
+}
+
+function renderVisitPreview(index, data) {
+  var $target = $('#profile_visit_summary_' + index);
+  if (!$target.length) return;
+  if (!data) {
+    $target.text('방문기록 현황을 확인할 수 없습니다.');
+    return;
+  }
+
+  var text = '전체 방문기록 ' + Number(data.total_count || 0) + '건 · 오류 복구 후보 ' + Number(data.recovery_count || 0) + '건';
+  var byDate = data.recovery_by_date || [];
+  if (byDate.length) {
+    var parts = [];
+    byDate.forEach(function(row) {
+      parts.push(String(row.date || '') + ' ' + Number(row.count || 0) + '건');
+    });
+    text += ' (' + parts.join(', ') + ')';
+  }
+  $target.text(text);
+}
+
+function refreshVisitPreviewForBlock($block, callback) {
+  var index = $block.attr('data-profile-index');
+  var profile = readProfile(index);
+  if (!profile.user_id) {
+    $('#profile_visit_summary_' + index).text('계정을 저장한 후 방문기록을 확인할 수 있습니다.');
+    if (callback) callback(null);
+    return;
+  }
+
+  globalSendCommand('visit_history_preview', profile.user_id, null, null, function(ret) {
+    if (ret.ret === 'success') {
+      renderVisitPreview(index, ret.data);
+      if (callback) callback(ret.data);
+    } else {
+      $('#profile_visit_summary_' + index).text(ret.msg || '방문기록 현황 확인 실패');
+      if (callback) callback(null);
+    }
+  });
+}
+
+function buildVisitConfirmMessage(profile, mode, data) {
+  var total = Number(data && data.total_count || 0);
+  var recovery = Number(data && data.recovery_count || 0);
+  var lines = [];
+
+  if (mode === 'recovery') {
+    lines.push(profile.user_id + ' 계정의 오류 방문기록을 복구합니다.');
+    lines.push('');
+    lines.push('복구 후보: ' + recovery + '건');
+    var byDate = data && data.recovery_by_date ? data.recovery_by_date : [];
+    byDate.forEach(function(row) {
+      lines.push('  ' + row.date + ': ' + Number(row.count || 0) + '건');
+    });
+    lines.push('');
+    lines.push('정상 방문기록, 쿠키, 프로필 설정, 실행 결과 이력은 유지됩니다.');
+    lines.push('작업 전 DB 백업이 자동으로 생성됩니다.');
+    lines.push('');
+    lines.push('계속하시겠습니까?');
+  } else {
+    lines.push(profile.user_id + ' 계정의 모든 방문기록을 초기화합니다.');
+    lines.push('');
+    lines.push('전체 방문기록: ' + total + '건');
+    lines.push('');
+    lines.push('쿠키와 프로필 설정, 과거 실행 결과는 유지됩니다.');
+    lines.push('이미 정상 적립한 URL도 다음 실행에서 다시 시도될 수 있습니다.');
+    lines.push('작업 전 DB 백업이 자동으로 생성됩니다.');
+    lines.push('');
+    lines.push('정말 전체 초기화하시겠습니까?');
+  }
+  return lines.join('\n');
+}
+
+function visitJobClass(status) {
+  if (status === 'COMPLETED') return 'bg-success';
+  if (status === 'FAILED') return 'bg-danger';
+  return 'bg-info';
+}
+
+function renderVisitJob(job, silentFinal) {
+  if (!job || !job.user_id) return;
+  var index = findProfileIndexByUserId(job.user_id);
+  if (index === null || index === undefined) return;
+
+  var percent = Math.max(0, Math.min(100, parseInt(job.percent || 0)));
+  var $wrap = $('#profile_visit_progress_wrap_' + index);
+  var $bar = $('#profile_visit_progress_' + index);
+  $wrap.show();
+  $bar
+    .removeClass('bg-success bg-danger bg-info')
+    .addClass(visitJobClass(job.status))
+    .css('width', percent + '%')
+    .text(percent + '%');
+
+  if (job.status === 'COMPLETED' || job.status === 'FAILED') {
+    $bar.removeClass('progress-bar-animated');
+  } else {
+    $bar.addClass('progress-bar-animated');
+  }
+
+  var stepText = '';
+  if (job.total_steps) {
+    stepText = ' · 단계 ' + Number(job.current_step || 0) + '/' + Number(job.total_steps || 0);
+  }
+  $('#profile_visit_progress_text_' + index).text(
+    (job.status_kor || job.status || '') + ' · ' + (job.progress_text || '') + stepText
+  );
+  $('#profile_visit_output_' + index).text(job.output || '');
+
+  if ((job.status === 'COMPLETED' || job.status === 'FAILED') && silentFinal) {
+    // 페이지를 새로 열었을 때 과거 완료 작업의 알림을 다시 띄우지 않는다.
+    visitJobFinalNotified[job.idx] = true;
+  }
+
+  if ((job.status === 'COMPLETED' || job.status === 'FAILED') && !visitJobFinalNotified[job.idx]) {
+    visitJobFinalNotified[job.idx] = true;
+    if (job.status === 'COMPLETED') {
+      notify(
+        (job.mode_name || '방문기록 작업') + ' 완료 - ' + Number(job.deleted_count || 0) + '건 정리',
+        'success'
+      );
+      refreshVisitPreviewForBlock($('#profile_pane_' + index));
+    } else {
+      notify((job.mode_name || '방문기록 작업') + ' 실패', 'warning');
+    }
+  }
+}
+
+function pollVisitJobs(silentFinal) {
+  globalSendCommand('visit_history_jobs', null, null, null, function(ret) {
+    var active = false;
+    if (ret.ret === 'success' && Array.isArray(ret.data)) {
+      ret.data.forEach(function(job) {
+        renderVisitJob(job, !!silentFinal);
+        if (job.status === 'READY' || job.status === 'RUNNING') active = true;
+      });
+    }
+
+    if (visitJobPollTimer) {
+      clearTimeout(visitJobPollTimer);
+      visitJobPollTimer = null;
+    }
+    if (active) {
+      visitJobPollTimer = setTimeout(function() { pollVisitJobs(false); }, 700);
+    }
+  });
+}
+
+function startVisitHistoryJob($block, mode) {
+  var index = $block.attr('data-profile-index');
+  var profile = readProfile(index);
+  if (!profile.user_id) {
+    notify('계정 ID를 먼저 저장해 주세요.', 'warning');
+    return;
+  }
+
+  refreshVisitPreviewForBlock($block, function(data) {
+    if (!data) return;
+    var targetCount = mode === 'recovery' ? Number(data.recovery_count || 0) : Number(data.total_count || 0);
+    if (targetCount <= 0) {
+      notify(mode === 'recovery' ? '오류 복구 후보가 없습니다.' : '초기화할 방문기록이 없습니다.', 'info');
+      return;
+    }
+
+    if (!window.confirm(buildVisitConfirmMessage(profile, mode, data))) return;
+
+    $('#profile_visit_progress_wrap_' + index).show();
+    $('#profile_visit_progress_' + index)
+      .removeClass('bg-success bg-danger')
+      .addClass('bg-info progress-bar-animated')
+      .css('width', '0%')
+      .text('0%');
+    $('#profile_visit_progress_text_' + index).text('작업을 시작하고 있습니다.');
+    $('#profile_visit_output_' + index).text('');
+
+    globalSendCommand('visit_history_reset', profile.user_id, mode, null, function(ret) {
+      if (ret.ret === 'success') {
+        if (ret.data) renderVisitJob(ret.data, false);
+        notify(ret.msg || '방문기록 작업을 시작했습니다.', 'info');
+        pollVisitJobs(false);
+      } else {
+        notify(ret.msg || '방문기록 작업 시작 실패', 'warning');
+        refreshVisitPreviewForBlock($block);
+      }
+    });
+  });
 }
 
 function setFieldValue(id, value) {
@@ -663,6 +945,21 @@ $("body").on('click', '[id^="profile_captcha_submit_"]', function(e) {
   submitCaptchaForBlock($(this).closest('.profile-block'));
 });
 
+$("body").on('click', '.np-visit-refresh-btn', function(e) {
+  e.preventDefault();
+  refreshVisitPreviewForBlock($(this).closest('.profile-block'));
+});
+
+$("body").on('click', '.np-visit-recovery-btn', function(e) {
+  e.preventDefault();
+  startVisitHistoryJob($(this).closest('.profile-block'), 'recovery');
+});
+
+$("body").on('click', '.np-visit-all-btn', function(e) {
+  e.preventDefault();
+  startVisitHistoryJob($(this).closest('.profile-block'), 'all');
+});
+
 $("body").on("click", ".np-login-image", function(e) {
   e.preventDefault();
   var src = $(this).attr("data-full-src") || $(this).attr("src");
@@ -720,6 +1017,12 @@ $(document).ready(function() {
   refreshNextProfileOrder();
   refreshProfileTitles();
   renderCookieStatuses();
+
+  // 계정 화면을 열면 현재 방문기록 수와 복구 후보를 바로 보여준다.
+  $('#profile_blocks .profile-block').each(function() {
+    refreshVisitPreviewForBlock($(this));
+  });
+  pollVisitJobs(true);
 });
 </script>
 

@@ -43,8 +43,14 @@ class ModuleMain(PluginModuleBase):
     ]
     install_jobs = []
     install_jobs_lock = threading.Lock()
+
+    # 방문기록 정리 작업도 설치 작업처럼 백그라운드 Job으로 관리한다.
+    visit_jobs = []
+    visit_jobs_lock = threading.Lock()
+
     collection_lock = threading.Lock()
     collection_running = False
+    visit_maintenance_running = False
 
     SOURCE_DEPENDENCY_KEYS = ("aiohttp", "beautifulsoup4", "playwright", "playwright-stealth", "SQLAlchemy")
 
@@ -175,6 +181,12 @@ class ModuleMain(PluginModuleBase):
                 return jsonify({"ret": "success", "msg": "login session closed"})
             if command == "profile_list":
                 return jsonify({"ret": "success", "data": self._profile_rows()})
+            if command == "visit_history_preview":
+                return jsonify(self._visit_history_preview(arg1))
+            if command == "visit_history_reset":
+                return jsonify(self._visit_history_reset_start(arg1, arg2))
+            if command == "visit_history_jobs":
+                return jsonify({"ret": "success", "data": self._visit_history_job_status()})
             if command == "install_dependency":
                 return jsonify(self._install_start(arg1))
             if command == "install_all_dependencies":
@@ -291,7 +303,8 @@ class ModuleMain(PluginModuleBase):
 
     def _mark_collection_running(self):
         with self.collection_lock:
-            if self.collection_running:
+            # 방문기록 삭제 중에는 수집이 같은 DB를 건드리지 않도록 시작을 막는다.
+            if self.collection_running or self.visit_maintenance_running:
                 return False
             self.collection_running = True
             return True
@@ -587,8 +600,11 @@ class ModuleMain(PluginModuleBase):
     def _collection_login_block_message(self):
         with self.collection_lock:
             running = self.collection_running
+            visit_running = self.visit_maintenance_running
         if running:
             return {"ret": "warning", "msg": "현재 수집중입니다. 수집이 완료되면 로그인 해 주세요"}
+        if visit_running:
+            return {"ret": "warning", "msg": "현재 방문기록 정리 작업중입니다. 완료 후 로그인 해 주세요"}
         return None
 
     def _merge_profile_cookies(self, profile, cookies):
@@ -760,9 +776,13 @@ class ModuleMain(PluginModuleBase):
     def _cookie_dir(self):
         return os.path.join(self._root_data_dir(), "cookies")
 
+    def _visit_backup_dir(self):
+        return os.path.join(self._root_data_dir(), "backup")
+
     def _ensure_dirs(self):
         os.makedirs(self._root_data_dir(), exist_ok=True)
         os.makedirs(self._cookie_dir(), exist_ok=True)
+        os.makedirs(self._visit_backup_dir(), exist_ok=True)
 
     def _bool_setting(self, key, default=False):
         raw = P.ModelSetting.get(key)
@@ -782,6 +802,205 @@ class ModuleMain(PluginModuleBase):
             return int(str(P.ModelSetting.get(key) or default).strip())
         except Exception:
             return default
+
+
+    def _visit_history_preview(self, user_id):
+        """계정별 방문기록 전체/오류 복구 후보를 화면에 보여주기 위한 미리보기."""
+        warning = self._source_dependency_warning()
+        if warning:
+            return warning
+
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return {"ret": "warning", "msg": "계정 ID가 비어 있습니다."}
+        if not self._find_profile(user_id):
+            return {"ret": "warning", "msg": "저장된 프로필을 찾을 수 없습니다."}
+
+        data = self._np().visit_history_preview(self._db_path(), user_id)
+        return {"ret": "success", "msg": "방문기록 현황을 확인했습니다.", "data": data}
+
+    def _visit_history_reset_start(self, user_id, mode):
+        """
+        방문기록 정리를 백그라운드 Job으로 시작한다.
+
+        collection_lock 하나로 포인트 수집과 방문기록 삭제가 동시에 DB를 수정하지 못하게 막는다.
+        """
+        warning = self._source_dependency_warning()
+        if warning:
+            return warning
+
+        user_id = str(user_id or "").strip()
+        mode = str(mode or "").strip().lower()
+        if mode not in ("recovery", "all"):
+            return {"ret": "warning", "msg": "지원하지 않는 방문기록 초기화 방식입니다."}
+        if not user_id or not self._find_profile(user_id):
+            return {"ret": "warning", "msg": "저장된 프로필을 찾을 수 없습니다."}
+
+        with self.collection_lock:
+            if self.collection_running:
+                return {"ret": "warning", "msg": "현재 포인트 수집중입니다. 완료 후 다시 시도해 주세요."}
+            if self.visit_maintenance_running:
+                return {"ret": "warning", "msg": "다른 방문기록 정리 작업이 진행중입니다."}
+            self.visit_maintenance_running = True
+
+        try:
+            preview = self._np().visit_history_preview(self._db_path(), user_id)
+            target_count = preview["recovery_count"] if mode == "recovery" else preview["total_count"]
+            if target_count <= 0:
+                with self.collection_lock:
+                    self.visit_maintenance_running = False
+                label = "오류 복구 후보" if mode == "recovery" else "방문기록"
+                return {"ret": "warning", "msg": f"정리할 {label}이 없습니다.", "data": preview}
+
+            mode_name = "오류 방문기록 복구" if mode == "recovery" else "방문기록 전체 초기화"
+            job = {
+                "idx": str(uuid.uuid4()),
+                "user_id": user_id,
+                "mode": mode,
+                "mode_name": mode_name,
+                "created_at": time.time(),
+                "status": "READY",
+                "status_kor": "대기",
+                "percent": 0,
+                "progress_text": "작업 대기 중",
+                "output": "",
+                "target_count": int(target_count),
+                "deleted_count": 0,
+                "backup_file": "",
+                "total_steps": 5,
+                "current_step": 0,
+            }
+            with self.visit_jobs_lock:
+                self.visit_jobs.append(job)
+                self.visit_jobs[:] = self.visit_jobs[-30:]
+                row = self._visit_history_job_row(job)
+
+            thread = threading.Thread(
+                target=self._run_visit_history_job,
+                args=(job,),
+                name=f"naverpaper_visit_{mode}_{user_id}",
+                daemon=True,
+            )
+            thread.start()
+            P.logger.info(
+                "[NaverPaper] 방문기록 작업 시작: 계정=%s 방식=%s 대상=%s건",
+                user_id,
+                mode_name,
+                target_count,
+            )
+            return {"ret": "success", "msg": f"{mode_name} 작업을 시작했습니다.", "data": row}
+        except Exception:
+            with self.collection_lock:
+                self.visit_maintenance_running = False
+            raise
+
+    def _visit_history_job_status(self):
+        with self.visit_jobs_lock:
+            return [self._visit_history_job_row(item) for item in self.visit_jobs[-30:]]
+
+    def _visit_history_job_row(self, job):
+        created_at = float(job.get("created_at") or time.time())
+        return {
+            "idx": job.get("idx") or "",
+            "user_id": job.get("user_id") or "",
+            "mode": job.get("mode") or "",
+            "mode_name": job.get("mode_name") or "",
+            "start_time": time.strftime("%m-%d %H:%M:%S", time.localtime(created_at)),
+            "status": job.get("status") or "READY",
+            "status_kor": job.get("status_kor") or job.get("status") or "",
+            "percent": int(job.get("percent") or 0),
+            "progress_text": job.get("progress_text") or "",
+            "output": job.get("output") or "",
+            "target_count": int(job.get("target_count") or 0),
+            "deleted_count": int(job.get("deleted_count") or 0),
+            "backup_file": job.get("backup_file") or "",
+            "current_step": int(job.get("current_step") or 0),
+            "total_steps": int(job.get("total_steps") or 0),
+        }
+
+    def _update_visit_job(self, job, percent, message, step=None):
+        """진행률과 단계 메시지를 한 곳에서 갱신해 UI 폴링 결과를 일관되게 유지한다."""
+        with self.visit_jobs_lock:
+            if job.get("status") not in ("FAILED", "COMPLETED"):
+                job["status"] = "RUNNING"
+                job["status_kor"] = "진행중"
+            job["percent"] = max(0, min(100, int(percent or 0)))
+            job["progress_text"] = str(message or "")
+            if step is not None:
+                job["current_step"] = int(step)
+            lines = [line for line in str(job.get("output") or "").splitlines() if line]
+            lines.append(f"[{job['percent']:3d}%] {job['progress_text']}")
+            job["output"] = "\n".join(lines[-40:])
+            return self._visit_history_job_row(job)
+
+    def _run_visit_history_job(self, job):
+        try:
+            self._update_visit_job(job, 5, "작업을 준비하고 있습니다.", 1)
+
+            # source_naverpaper의 실제 DB 작업이 각 단계에서 진행률을 콜백한다.
+            def on_progress(percent, message):
+                if percent < 20:
+                    step = 1
+                elif percent < 45:
+                    step = 2
+                elif percent < 80:
+                    step = 3
+                elif percent < 95:
+                    step = 4
+                else:
+                    step = 5
+                self._update_visit_job(job, percent, message, step)
+
+            result = self._np().reset_visit_history(
+                self._db_path(),
+                job["user_id"],
+                job["mode"],
+                self._visit_backup_dir(),
+                progress=on_progress,
+            )
+
+            with self.visit_jobs_lock:
+                job["status"] = "COMPLETED"
+                job["status_kor"] = "완료"
+                job["percent"] = 100
+                job["progress_text"] = (
+                    f"완료: 방문기록 {int(result.get('deleted_count') or 0)}건 정리"
+                )
+                job["target_count"] = int(result.get("target_count") or job.get("target_count") or 0)
+                job["deleted_count"] = int(result.get("deleted_count") or 0)
+                backup_path = str(result.get("backup_path") or "")
+                job["backup_file"] = os.path.basename(backup_path) if backup_path else ""
+                job["current_step"] = 5
+                lines = [line for line in str(job.get("output") or "").splitlines() if line]
+                lines.append(
+                    f"[100%] 완료 - 대상 {job['target_count']}건 / 삭제 {job['deleted_count']}건"
+                )
+                if job["backup_file"]:
+                    lines.append(f"백업: {job['backup_file']}")
+                job["output"] = "\n".join(lines[-40:])
+
+            P.logger.info(
+                "[NaverPaper] 방문기록 작업 완료: 계정=%s 방식=%s 대상=%s건 삭제=%s건 백업=%s",
+                job["user_id"],
+                job["mode_name"],
+                job["target_count"],
+                job["deleted_count"],
+                job["backup_file"],
+            )
+        except Exception as e:
+            P.logger.error("[NaverPaper] 방문기록 작업 실패: %s", str(e))
+            P.logger.error(traceback.format_exc())
+            with self.visit_jobs_lock:
+                job["status"] = "FAILED"
+                job["status_kor"] = "실패"
+                job["percent"] = 100
+                job["progress_text"] = f"작업 실패: {str(e)}"
+                lines = [line for line in str(job.get("output") or "").splitlines() if line]
+                lines.append(f"[실패] {str(e)}")
+                job["output"] = "\n".join(lines[-40:])
+        finally:
+            with self.collection_lock:
+                self.visit_maintenance_running = False
 
     def _dependency_status(self):
         packages = []

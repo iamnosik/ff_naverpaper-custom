@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import html as html_lib
 import json
 import os
 import queue
+import sqlite3
 import re
 import threading
 import time
@@ -3334,6 +3337,225 @@ def delete_old_stuff(session_db, keep_campaign_days: int, keep_user_days: int, e
         session_db.query(User).filter(User.updated_at < user_cutoff).delete()
     except Exception as e:
         emit(f"cleanup error - {e}")
+
+
+
+def _visit_recovery_rows(session, user_id: str):
+    """
+    오류 방문기록 복구 후보를 계산한다.
+
+    방문 0건·적립 0점으로 끝난 실행 시간에 생성된 방문기록을 기본 후보로 잡되,
+    실제 방문 성공 상세기록이나 "이미 1회 적립됨"으로 확정된 기록은 제외한다.
+    이렇게 하면 로그인/쿠키 오류로 잘못 저장된 방문기록만 최대한 보수적으로 복구할 수 있다.
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return []
+
+    query = text(
+        """
+        WITH bad_runs AS (
+            SELECT r.id, r.started_at, r.finished_at
+            FROM run_history r
+            JOIN run_account_summary s ON s.run_id = r.id
+            WHERE s.user_id = :user_id
+              AND COALESCE(s.visited_url_count, 0) = 0
+              AND COALESCE(s.estimated_points, 0) = 0
+        )
+        SELECT DISTINCT v.url AS url, v.visited_at AS visited_at
+        FROM url_visits v
+        JOIN bad_runs r
+          ON v.visited_at >= r.started_at
+         AND v.visited_at <= r.finished_at
+        WHERE v.user_id = :user_id
+          AND NOT EXISTS (
+              SELECT 1
+              FROM run_detail d
+              WHERE d.run_id = r.id
+                AND d.user_id = :user_id
+                AND d.url = v.url
+                AND (
+                    d.status = 'visited'
+                    OR LOWER(TRIM(COALESCE(d.message, ''))) = 'already received once'
+                )
+          )
+        ORDER BY v.visited_at ASC
+        """
+    )
+    return list(session.execute(query, {"user_id": user_id}).fetchall())
+
+
+def visit_history_preview(db_path: str, user_id: str):
+    """계정별 방문기록 전체 건수와 오류 복구 후보를 미리 계산한다."""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        raise ValueError("계정 ID가 비어 있습니다.")
+
+    db = Database(db_path)
+    db.create_all()
+    with db.get_session() as session:
+        total_count = session.query(UrlVisit).filter_by(user_id=user_id).count()
+        rows = _visit_recovery_rows(session, user_id)
+        by_date = {}
+        for row in rows:
+            visited_at = row.visited_at
+            if hasattr(visited_at, "strftime"):
+                day = visited_at.strftime("%Y-%m-%d")
+            else:
+                day = str(visited_at or "")[:10] or "날짜 미상"
+            by_date[day] = by_date.get(day, 0) + 1
+
+        return {
+            "user_id": user_id,
+            "total_count": int(total_count or 0),
+            "recovery_count": len(rows),
+            "recovery_by_date": [
+                {"date": day, "count": count}
+                for day, count in sorted(by_date.items())
+            ],
+        }
+
+
+def _backup_visit_database(db_path: str, backup_dir: str, mode: str, user_id: str):
+    """
+    방문기록 삭제 직전 SQLite 온라인 백업을 만든다.
+    WAL 사용 여부와 관계없이 sqlite3 backup API를 사용해 일관된 백업 파일을 생성한다.
+    """
+    backup_dir = os.path.abspath(backup_dir)
+    os.makedirs(backup_dir, exist_ok=True)
+
+    safe_user = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(user_id or "account"))
+    safe_mode = "recovery" if mode == "recovery" else "all"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"naverpaper-방문기록-{safe_mode}-{safe_user}-{stamp}.sqlite"
+    backup_path = os.path.join(backup_dir, filename)
+
+    source = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True, timeout=10)
+    target = sqlite3.connect(backup_path)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+    # 방문기록 관리 백업은 최근 10개만 보관한다.
+    try:
+        backups = sorted(
+            [
+                os.path.join(backup_dir, name)
+                for name in os.listdir(backup_dir)
+                if name.startswith("naverpaper-방문기록-") and name.endswith(".sqlite")
+            ],
+            key=lambda path: os.path.getmtime(path),
+            reverse=True,
+        )
+        for old_path in backups[10:]:
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return backup_path
+
+
+def reset_visit_history(
+    db_path: str,
+    user_id: str,
+    mode: str,
+    backup_dir: str,
+    progress: Optional[Callable[[int, str], None]] = None,
+):
+    """
+    계정별 방문기록을 안전하게 정리한다.
+
+    mode='recovery' : 오류 실행 중 잘못 저장된 방문기록만 삭제
+    mode='all'      : 해당 계정의 방문기록 전체 삭제
+    """
+    user_id = str(user_id or "").strip()
+    mode = str(mode or "").strip().lower()
+    if not user_id:
+        raise ValueError("계정 ID가 비어 있습니다.")
+    if mode not in ("recovery", "all"):
+        raise ValueError("지원하지 않는 방문기록 초기화 방식입니다.")
+
+    def report(percent, message):
+        if progress:
+            progress(int(percent), str(message))
+
+    report(5, "작업을 준비하고 있습니다.")
+    before = visit_history_preview(db_path, user_id)
+    target_count = before["recovery_count"] if mode == "recovery" else before["total_count"]
+
+    if target_count <= 0:
+        report(100, "정리할 방문기록이 없습니다.")
+        return {
+            "user_id": user_id,
+            "mode": mode,
+            "target_count": 0,
+            "deleted_count": 0,
+            "backup_path": "",
+            "before": before,
+            "after": before,
+        }
+
+    report(20, f"삭제 전 DB를 백업하고 있습니다. 대상 {target_count}건")
+    backup_path = _backup_visit_database(db_path, backup_dir, mode, user_id)
+
+    report(45, "삭제 대상을 다시 확인하고 있습니다.")
+    db = Database(db_path)
+    db.create_all()
+
+    with db.get_session() as session:
+        if mode == "recovery":
+            # 미리보기 이후 상태가 바뀌었을 수 있으므로 삭제 직전 후보를 다시 계산한다.
+            rows = _visit_recovery_rows(session, user_id)
+            target_urls = [row.url for row in rows]
+            target_count = len(target_urls)
+            if target_urls:
+                # SQLite의 바인드 변수 제한에 걸리지 않도록 작은 묶음으로 나눠 삭제한다.
+                deleted_count = 0
+                for start in range(0, len(target_urls), 500):
+                    batch = target_urls[start : start + 500]
+                    deleted_count += (
+                        session.query(UrlVisit)
+                        .filter(UrlVisit.user_id == user_id, UrlVisit.url.in_(batch))
+                        .delete(synchronize_session=False)
+                    )
+            else:
+                deleted_count = 0
+        else:
+            target_count = session.query(UrlVisit).filter_by(user_id=user_id).count()
+            deleted_count = (
+                session.query(UrlVisit)
+                .filter_by(user_id=user_id)
+                .delete(synchronize_session=False)
+            )
+
+    report(80, f"방문기록 {int(deleted_count or 0)}건을 삭제했습니다.")
+    after = visit_history_preview(db_path, user_id)
+
+    if mode == "recovery" and after["recovery_count"] != 0:
+        raise RuntimeError(
+            f"오류 방문기록 검증 실패: 복구 후보가 {after['recovery_count']}건 남아 있습니다."
+        )
+    if mode == "all" and after["total_count"] != 0:
+        raise RuntimeError(
+            f"전체 초기화 검증 실패: 방문기록이 {after['total_count']}건 남아 있습니다."
+        )
+
+    report(95, "삭제 결과와 DB 상태를 확인했습니다.")
+    report(100, "방문기록 관리 작업이 완료되었습니다.")
+    return {
+        "user_id": user_id,
+        "mode": mode,
+        "target_count": int(target_count or 0),
+        "deleted_count": int(deleted_count or 0),
+        "backup_path": backup_path,
+        "before": before,
+        "after": after,
+    }
 
 
 def recent_runs(db_path: str, limit: int = 30):
