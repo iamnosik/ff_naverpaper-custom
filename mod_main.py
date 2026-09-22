@@ -420,12 +420,14 @@ class ModuleMain(PluginModuleBase):
             return {"ret": "warning", "msg": "invalid profile payload"}
         if not profile.get("user_id"):
             return {"ret": "warning", "msg": "account id is required"}
-        profiles = [item for item in self._profiles() if item.get("user_id") != profile["user_id"]]
+        previous_profiles = self._profiles()
+        previous_profile = next((item for item in previous_profiles if item.get("user_id") == profile["user_id"]), None)
+        profiles = [item for item in previous_profiles if item.get("user_id") != profile["user_id"]]
         if not profile.get("profile_order"):
             profile["profile_order"] = self._next_profile_order(profiles)
         profiles.append(profile)
         P.ModelSetting.set("naver_profiles", json.dumps(profiles, ensure_ascii=False))
-        self._write_profile_cookie(profile)
+        self._sync_profile_cookie_on_save(profile, previous_profile)
         return {"ret": "success", "msg": "profile saved", "data": self._profile_rows()}
 
     def _profile_save_all(self, payload):
@@ -464,9 +466,10 @@ class ModuleMain(PluginModuleBase):
         remove_ids.update(previous_ids - current_ids)
 
         normalized = sorted(normalized, key=lambda item: item.get("profile_order") or 0)
+        previous_by_id = {item.get("user_id"): item for item in previous_profiles if item.get("user_id")}
         P.ModelSetting.set("naver_profiles", json.dumps(normalized, ensure_ascii=False))
         for profile in normalized:
-            self._write_profile_cookie(profile)
+            self._sync_profile_cookie_on_save(profile, previous_by_id.get(profile.get("user_id")))
         for user_id in remove_ids:
             cookie_path = os.path.join(self._cookie_dir(), f"{user_id}.json")
             try:
@@ -635,16 +638,65 @@ class ModuleMain(PluginModuleBase):
             P.logger.warning("[NaverPaper] failed to delete cookie file: %s", cookie_path)
         return {"ret": "success", "msg": "profile deleted", "data": self._profile_rows()}
 
+    def _profile_cookie_values(self, profile):
+        profile = profile or {}
+        return (
+            str(profile.get("nid_aut") or "").strip(),
+            str(profile.get("nid_ses") or "").strip(),
+            str(profile.get("nid_jst") or "").strip(),
+        )
+
+    def _delete_profile_cookie_file(self, user_id):
+        path = os.path.join(self._cookie_dir(), f"{user_id}.json")
+        try:
+            if user_id and os.path.exists(path):
+                os.remove(path)
+                P.logger.info("[NaverPaper] removed cookie file for %s", user_id)
+        except Exception:
+            P.logger.warning("[NaverPaper] failed to delete cookie file: %s", path)
+
+    def _sync_profile_cookie_on_save(self, profile, previous_profile=None):
+        """Only touch the runtime cookie file when cookie fields actually changed.
+
+        Account-page saves often submit the same cookie textareas together with
+        unrelated settings. Rewriting those values can resurrect stale cookies
+        that runtime login intentionally discarded.
+        """
+        current_values = self._profile_cookie_values(profile)
+        previous_values = self._profile_cookie_values(previous_profile)
+
+        if previous_profile is not None and current_values == previous_values:
+            P.logger.info("[NaverPaper] profile save kept existing cookie file for %s", profile.get("user_id"))
+            return False
+
+        nid_aut, nid_ses, nid_jst = current_values
+        if not nid_aut and not nid_ses and not nid_jst:
+            self._delete_profile_cookie_file(profile.get("user_id"))
+            return True
+
+        if not nid_aut or not nid_ses:
+            P.logger.warning(
+                "[NaverPaper] incomplete manual cookies for %s; runtime cookie file cleared",
+                profile.get("user_id"),
+            )
+            self._delete_profile_cookie_file(profile.get("user_id"))
+            return True
+
+        self._write_profile_cookie(profile)
+        P.logger.info("[NaverPaper] manual cookie fields changed; cookie file updated for %s", profile.get("user_id"))
+        return True
+
     def _write_profile_cookie(self, profile):
-        if not (profile.get("nid_aut") or profile.get("nid_ses") or profile.get("nid_jst")):
-            return
+        nid_aut, nid_ses, nid_jst = self._profile_cookie_values(profile)
+        if not nid_aut or not nid_ses:
+            return False
         self._ensure_dirs()
         expires = int(time.time()) + 180 * 24 * 60 * 60
         cookies = []
         for name, value in (
-            ("NID_AUT", profile.get("nid_aut")),
-            ("NID_SES", profile.get("nid_ses")),
-            ("NID_JST", profile.get("nid_jst")),
+            ("NID_AUT", nid_aut),
+            ("NID_SES", nid_ses),
+            ("NID_JST", nid_jst),
         ):
             if not value:
                 continue
@@ -663,6 +715,7 @@ class ModuleMain(PluginModuleBase):
         storage_state = {"cookies": cookies, "origins": []}
         with open(os.path.join(self._cookie_dir(), f"{profile['user_id']}.json"), "w", encoding="utf-8") as f:
             json.dump(storage_state, f, ensure_ascii=False, indent=2)
+        return True
 
     def _sync_profiles_from_cookie_files(self):
         profiles = self._profiles()
