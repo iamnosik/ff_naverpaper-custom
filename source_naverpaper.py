@@ -44,9 +44,12 @@ NAVERPAY_MISSION_DETAIL_URL = "https://point.pay.naver.com/pc/mission-detail?dat
 PINCRUX_SOURCE_URL_PREFIX = "https://external-token.pay.naver.com"
 
 LOGIN_SESSION_TTL = 300
+PERSISTENT_COOKIE_TTL_SECONDS = 180 * 24 * 60 * 60
+PERSISTENT_COOKIE_NAMES = ("NID_AUT", "NID_SES", "NID_JST")
 _login_sessions = {}
 _login_sessions_lock = threading.Lock()
 _login_loop = None
+_login_loop_thread = None
 _login_loop_lock = threading.Lock()
 
 
@@ -565,11 +568,43 @@ def storage_cookie_values(storage_state):
     try:
         for cookie in (storage_state or {}).get("cookies", []):
             name = cookie.get("name")
-            if name in ("NID_AUT", "NID_SES", "NID_JST"):
+            if name in PERSISTENT_COOKIE_NAMES:
                 values[name] = cookie.get("value") or ""
     except Exception:
         return {}
     return values
+
+
+def normalize_persistent_login_cookies(storage_state):
+    """Persist Naver login cookies that were issued as browser-session cookies.
+
+    Naver can return NID_AUT/NID_SES with expires=-1 for some accounts even
+    after a successful login.  FF runs without keeping that browser process
+    alive, so those cookies would otherwise be rejected on the next scheduled
+    run.  Existing persistent cookies are left untouched.
+    """
+    if not isinstance(storage_state, dict):
+        return storage_state, []
+
+    normalized = dict(storage_state)
+    cookies = []
+    changed = []
+    persistent_expiry = int(time.time()) + PERSISTENT_COOKIE_TTL_SECONDS
+
+    for raw_cookie in storage_state.get("cookies", []):
+        cookie = dict(raw_cookie)
+        name = cookie.get("name")
+        if (
+            name in PERSISTENT_COOKIE_NAMES
+            and cookie.get("value")
+            and cookie.get("expires", -1) == -1
+        ):
+            cookie["expires"] = persistent_expiry
+            changed.append(name)
+        cookies.append(cookie)
+
+    normalized["cookies"] = cookies
+    return normalized, changed
 
 
 def storage_has_required_cookies(storage_state):
@@ -740,8 +775,10 @@ async def refresh_cookie(account: AccountConfig, cookie_dir: str, proxy_url: str
                 emit(f"{account.user_id}: cookie refresh failed - {login_message}")
                 return {"ret": "warning", "msg": "cookie refresh failed. Check plugin log for login diagnostics.", "cookies": {}}
             storage = await context.storage_state()
-            with open(cookie_path(cookie_dir, account.user_id), "w", encoding="utf-8") as f:
-                json.dump(storage, f, ensure_ascii=False, indent=2)
+            storage, normalized_names = normalize_persistent_login_cookies(storage)
+            if normalized_names:
+                emit(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
+            save_storage_state(cookie_dir, account.user_id, storage)
             return {"ret": "success", "msg": "cookie refreshed", "cookies": storage_cookie_values(storage)}
         finally:
             await context.close()
@@ -789,6 +826,9 @@ async def refresh_cookie_from_profile(
             await Stealth().apply_stealth_async(page)
 
             storage = await context.storage_state()
+            storage, normalized_names = normalize_persistent_login_cookies(storage)
+            if normalized_names and storage_has_required_cookies(storage):
+                log(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
             ok, message = check_storage_data_status(storage)
             if ok:
                 save_storage_state(cookie_dir, account.user_id, storage)
@@ -803,6 +843,9 @@ async def refresh_cookie_from_profile(
                 log(f"{account.user_id}: browser profile login check failed - {e}")
 
             storage = await context.storage_state()
+            storage, normalized_names = normalize_persistent_login_cookies(storage)
+            if normalized_names and storage_has_required_cookies(storage):
+                log(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
             ok, message = check_storage_data_status(storage)
             if ok:
                 save_storage_state(cookie_dir, account.user_id, storage)
@@ -820,6 +863,9 @@ async def refresh_cookie_from_profile(
                 return False, login_message
 
             storage = await context.storage_state()
+            storage, normalized_names = normalize_persistent_login_cookies(storage)
+            if normalized_names:
+                log(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
             ok, message = check_storage_data_status(storage)
             if not ok:
                 return False, message
@@ -869,31 +915,53 @@ def _run_async(coro):
 
 
 def _get_login_loop():
-    global _login_loop
+    global _login_loop, _login_loop_thread
     with _login_loop_lock:
-        if _login_loop and not _login_loop.is_closed() and _login_loop.is_running():
+        if (
+            _login_loop
+            and not _login_loop.is_closed()
+            and _login_loop.is_running()
+            and _login_loop_thread
+            and _login_loop_thread.is_alive()
+        ):
             return _login_loop
-        _login_loop = None
+
         loop = asyncio.new_event_loop()
+        ready = threading.Event()
 
         def run_loop():
             asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
             loop.run_forever()
 
-        thread = threading.Thread(target=run_loop, daemon=True)
+        thread = threading.Thread(
+            target=run_loop,
+            name="ff_naverpaper_login_loop",
+            daemon=True,
+        )
         thread.start()
+        if not ready.wait(timeout=5):
+            raise RuntimeError("login event loop failed to start")
+
         _login_loop = loop
+        _login_loop_thread = thread
         return loop
 
 
 def _run_login_async(coro):
-    global _login_loop
+    global _login_loop, _login_loop_thread
+    loop = _get_login_loop()
     try:
-        future = asyncio.run_coroutine_threadsafe(coro, _get_login_loop())
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result()
     except RuntimeError:
-        with _login_loop_lock:
-            _login_loop = None
+        # Do not discard a healthy login loop because application code raised
+        # RuntimeError. Only rebuild it when the worker loop itself stopped.
+        if loop.is_closed() or not loop.is_running():
+            with _login_loop_lock:
+                if _login_loop is loop:
+                    _login_loop = None
+                    _login_loop_thread = None
         raise
 
 
@@ -1015,6 +1083,9 @@ async def open_login_screen(account: AccountConfig, cookie_dir: str, proxy_url: 
     await Stealth().apply_stealth_async(page)
     try:
         storage = await context.storage_state()
+        storage, normalized_names = normalize_persistent_login_cookies(storage)
+        if normalized_names and storage_has_required_cookies(storage):
+            emit(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
         ok, cookie_message = check_storage_data_status(storage)
         if ok:
             save_storage_state(cookie_dir, account.user_id, storage)
@@ -1135,9 +1206,10 @@ async def submit_login_captcha(user_id: str, captcha_text: str, cookie_dir: str,
         if not storage_has_required_cookies(storage):
             emit(f"{user_id}: manual login diagnostic - required cookies missing url={page.url}")
             return {"ret": "warning", "msg": "login did not produce required cookies", "screenshot": await _login_screenshot_payload(page)}
-        os.makedirs(cookie_dir, exist_ok=True)
-        with open(cookie_path(cookie_dir, user_id), "w", encoding="utf-8") as f:
-            json.dump(storage, f, ensure_ascii=False, indent=2)
+        storage, normalized_names = normalize_persistent_login_cookies(storage)
+        if normalized_names:
+            emit(f"{user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
+        save_storage_state(cookie_dir, user_id, storage)
         await _close_login_session(user_id)
         emit(f"{user_id}: captcha login success")
         return {"ret": "success", "msg": "cookie refreshed", "cookies": storage_cookie_values(storage)}
