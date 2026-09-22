@@ -1379,6 +1379,27 @@ async def wait_for_dwell_ready(page) -> float:
     return time.monotonic() - started_at
 
 
+def is_naver_login_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or ""))
+        return parsed.hostname == "nid.naver.com" and "login" in (parsed.path or "").lower()
+    except Exception:
+        return False
+
+
+def should_record_url_visit(detail) -> bool:
+    if detail is None:
+        return False
+    if getattr(detail, "status", "") == "visited":
+        return True
+    # A one-time reward that explicitly reports it was already received is a
+    # terminal result. Keeping it visited prevents pointless retries.
+    return (
+        getattr(detail, "status", "") == "skipped"
+        and str(getattr(detail, "message", "") or "").strip().lower() == "already received once"
+    )
+
+
 def emit_visited(user_id: str, url: str, emit: Callable[[str], None], dwell_seconds: Optional[float] = None, actual_dwell: Optional[float] = None, ready_wait: Optional[float] = None):
     if is_excluded_reward_url(url):
         emit(f"{user_id}: excluded reward URL - {url}")
@@ -1446,6 +1467,9 @@ async def process_live_view_link(page, link: str, user_id: str, emit: Callable[[
     except Exception:
         await campaign_page_diagnostic(page, user_id, "live-view goto timeout/error", emit)
         raise
+    if is_naver_login_url(page.url):
+        emit(f"{user_id}: live-view redirected to Naver login; retry later")
+        return DetailResult(user_id=user_id, url=link, status="skipped", message="redirected to Naver login")
     dwell_seconds = max(1, int(seconds or 1)) + 3
     ready_wait = await wait_for_dwell_ready(page)
     dwell_started_at = time.monotonic()
@@ -1978,6 +2002,9 @@ async def visit_campaign_url(page, link: str, session_db, user_id: str, emit: Ca
         emit(f"{user_id}: excluded reward URL - {page.url}")
         record_excluded_reward_source(session_db, excluded_reward_sources, link, page.url)
         return DetailResult(user_id=user_id, url=link, status="skipped", message="excluded reward URL")
+    if is_naver_login_url(page.url):
+        emit(f"{user_id}: reward URL redirected to Naver login; retry later - {link}")
+        return DetailResult(user_id=user_id, url=link, status="skipped", message="redirected to Naver login")
     emit(f"{user_id}: visited {page.url}")
     if page.url.startswith("https://campaign2"):
         return await process_campaign2_link(page, page.url, session_db, user_id, emit)
@@ -2047,6 +2074,14 @@ async def handle_naverpay_mission_detail(page, link: str, session_db, user_id: s
             except Exception:
                 pass
             await wait_for_bridge_redirect(active_page)
+            if is_naver_login_url(active_page.url):
+                emit(f"{user_id}: mission reward redirected to Naver login; retry later")
+                if work_page is None and active_page is not page:
+                    try:
+                        await active_page.close()
+                    except Exception:
+                        pass
+                continue
             if is_excluded_reward_url(active_page.url):
                 emit(f"{user_id}: excluded reward URL - {active_page.url}")
                 record_excluded_reward_source(session_db, excluded_reward_sources, source_key, active_page.url)
@@ -2091,6 +2126,8 @@ async def handle_naverpay_mission_detail(page, link: str, session_db, user_id: s
                     await page.bring_to_front()
                 except Exception:
                     pass
+    if visited <= 0:
+        return DetailResult(user_id=user_id, url=link, status="skipped", message="mission rewards visited: 0")
     return DetailResult(user_id=user_id, url=link, status="visited", message=f"mission rewards visited: {visited}")
 
 
@@ -2240,10 +2277,12 @@ async def process_campaign_links(page, campaign_links, session_db, user_id: str,
                 detail.url = link
             else:
                 detail = await visit_campaign_url(page, link, session_db, user_id, emit, excluded_reward_sources)
-            if is_reward_url(link) and not should_revisit_url(link):
+            if should_record_url_visit(detail) and is_reward_url(link) and not should_revisit_url(link):
                 existing_visit = session_db.query(UrlVisit).filter_by(url=link, user_id=user_id).first()
                 if not existing_visit:
                     session_db.add(UrlVisit(url=link, user_id=user_id, visited_at=datetime.now()))
+            elif is_reward_url(link) and not should_revisit_url(link):
+                emit(f"{user_id}: visit history not recorded status={detail.status} message={detail.message}")
             details.append(detail)
         except Exception as e:
             details.append(DetailResult(user_id=user_id, url=link, status="error", message=str(e)))
