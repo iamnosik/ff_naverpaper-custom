@@ -1112,6 +1112,17 @@ async def open_login_screen(account: AccountConfig, cookie_dir: str, proxy_url: 
             emit(f"{account.user_id}: normalized session cookies for persistence: {', '.join(normalized_names)}")
         ok, cookie_message = check_storage_data_status(storage)
         if ok:
+            try:
+                await page.goto("https://pay.naver.com/pointshistory/list?category=all", wait_until="domcontentloaded", timeout=25000)
+                await page.wait_for_timeout(1200)
+                body = await page.locator("body").inner_text(timeout=6000)
+                ok = not is_naver_login_url(page.url) and "내 포인트" in body
+                if not ok:
+                    emit(f"{account.user_id}: browser profile cookies rejected by Naver; opening login screen")
+            except Exception:
+                ok = False
+                emit(f"{account.user_id}: browser profile login could not be verified; opening login screen")
+        if ok:
             save_storage_state(cookie_dir, account.user_id, storage)
             await context.close()
             await playwright.stop()
@@ -2379,6 +2390,12 @@ async def process_account(
         login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
         if login_ok:
             before_points = await get_naverpay_point_balance(page)
+            if is_naver_login_url(page.url):
+                emit(f"{account.user_id}: Naver Pay session rejected; reward visits safely skipped")
+                result.details.append(DetailResult(user_id=account.user_id, status="login_error", message="Naver login required; refresh this profile cookie"))
+                await context.close()
+                await browser.close()
+                return result
             details = await process_campaign_links(page, campaign_links, session_db, account.user_id, emit, excluded_reward_sources)
             after_points = await get_naverpay_point_balance(page)
             result.details.extend(details)
@@ -2454,6 +2471,12 @@ async def process_account_manual_link(
         login_ok, login_message = await naver_login(page, account, cookie_dir, emit)
         if login_ok:
             before_points = await get_naverpay_point_balance(page)
+            if is_naver_login_url(page.url):
+                emit(f"{account.user_id}: Naver Pay session rejected; manual reward safely skipped")
+                result.details.append(DetailResult(user_id=account.user_id, url=link, status="login_error", message="Naver login required; refresh this profile cookie"))
+                await context.close()
+                await browser.close()
+                return result
             details = await process_campaign_links(page, [link], session_db, account.user_id, emit)
             after_points = await get_naverpay_point_balance(page)
             result.details.extend(details)
